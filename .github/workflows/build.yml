@@ -1,4 +1,4 @@
-name: Build PlusGuard Messenger APK
+name: Build Full Native PlusGuard APK
 
 on:
   push:
@@ -6,283 +6,122 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-apk:
-    runs-on: ubuntu-latest
+  build-native-telegram:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
 
     steps:
+      - name: Free Disk Space (Required for Telegram C++ NDK build)
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.5'
-
-      - name: Generate Android Project Structure
+      - name: Clone Official Telegram Android Source (with submodules)
         run: |
-          mkdir -p app/src/main/java/org/plusguard/messenger
-          mkdir -p app/src/main/res/values
+          git clone --depth 1 --recursive https://github.com/Telegram-FOSS-Team/Telegram-FOSS.git telegram-src
 
-          cat << 'EOF' > settings.gradle
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
-          rootProject.name = "PlusGuard"
-          include ':app'
+      - name: Inject Anti-Screenshot, Anti-Record & Plus Style Patches
+        working-directory: telegram-src
+        run: |
+          python3 - << 'EOF'
+          import os, glob, re
+
+          print("🔍 Applying Stealth Screenshot & Plus Patches...")
+
+          # 1. Remove FLAG_SECURE everywhere (Allows screenshot & screen recording in Secret Chats & Private Channels)
+          for root, _, files in os.walk("TMessagesProj"):
+              for file in files:
+                  if file.endswith(".java"):
+                      path = os.path.join(root, file)
+                      with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                          content = f.read()
+
+                      modified = False
+
+                      # Strip WindowManager.LayoutParams.FLAG_SECURE
+                      if "FLAG_SECURE" in content:
+                          content = content.replace("WindowManager.LayoutParams.FLAG_SECURE", "0")
+                          modified = True
+
+                      # 2. Block Screenshot Notification in SecretChatHelper.java
+                      if file == "SecretChatHelper.java" and "sendScreenshotNotification(" in content:
+                          content = re.sub(
+                              r'(public\s+void\s+sendScreenshotNotification\s*\([^)]*\)\s*\{)',
+                              r'\1 if (true) return;',
+                              content
+                          )
+                          modified = True
+                          print("✅ Patched SecretChatHelper: Screenshot notification blocked!")
+
+                      # 3. Block Screenshot Notification in ChatActivity.java (TTL / Disappearing media)
+                      if file == "ChatActivity.java" and "sendScreenshotNotification" in content:
+                          content = content.replace("SendMessagesHelper.getInstance(currentAccount).sendScreenshotNotification", "//blocked")
+                          modified = True
+                          print("✅ Patched ChatActivity: Media screenshot notification blocked!")
+
+                      # 4. Bypass Channel Copy/Save/Forward Restrictions (noforwards)
+                      if file == "MessagesController.java" and "isChatNoForwards(" in content:
+                          content = re.sub(
+                              r'(public\s+boolean\s+isChatNoForwards\s*\([^)]*\)\s*\{)',
+                              r'\1 if (true) return false;',
+                              content
+                          )
+                          modified = True
+                          print("✅ Patched MessagesController: Channel save/forward restrictions removed!")
+
+                      # 5. Apply Plus Messenger Classic Green Color (#008069) as Default Theme Color
+                      if file == "Theme.java":
+                          content = content.replace("0xff527da3", "0xff008069")
+                          content = content.replace("0xff5085b1", "0xff008069")
+                          modified = True
+                          print("✅ Patched Theme.java: Plus Messenger Green applied!")
+
+                      if modified:
+                          with open(path, "w", encoding="utf-8") as f:
+                              f.write(content)
+
           EOF
 
-          cat << 'EOF' > build.gradle
-          plugins {
-              id 'com.android.application' version '8.2.0' apply false
-          }
+      - name: Configure Dummy Signing Key & API Keys
+        working-directory: telegram-src
+        run: |
+          # Generate a release keystore so APK installs cleanly on any phone
+          keytool -genkey -v -keystore TMessagesProj/config/release.keystore \
+            -alias release -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=PlusGuard, OU=Dev, O=PlusGuard, L=Tehran, S=TH, C=IR"
+
+          cat << 'EOF' >> gradle.properties
+          APP_ID=6
+          APP_HASH=eb06d4abfb49dc3eeb1aeb98ae0f581e
+          RELEASE_KEY_PASSWORD=android
+          RELEASE_KEY_ALIAS=release
+          RELEASE_STORE_PASSWORD=android
+          org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m
           EOF
 
-          cat << 'EOF' > app/build.gradle
-          plugins {
-              id 'com.android.application'
-          }
+      - name: Install Required Android NDK & CMake
+        run: |
+          yes | sudo $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;21.4.7075529" "cmake;3.18.1" "platforms;android-34" "build-tools;34.0.0"
 
-          android {
-              namespace 'org.plusguard.messenger'
-              compileSdk 34
+      - name: Compile Full Telegram APK (Takes ~25-40 mins)
+        working-directory: telegram-src
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleafatDebug --no-daemon --stacktrace
 
-              defaultConfig {
-                  applicationId "org.plusguard.messenger"
-                  minSdk 24
-                  targetSdk 34
-                  versionCode 1
-                  versionName "1.0-PlusGuard"
-              }
-
-              buildTypes {
-                  debug {
-                      minifyEnabled false
-                  }
-              }
-
-              compileOptions {
-                  sourceCompatibility JavaVersion.VERSION_17
-                  targetCompatibility JavaVersion.VERSION_17
-              }
-          }
-
-          dependencies {
-          }
-          EOF
-
-          cat << 'EOF' > app/src/main/AndroidManifest.xml
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-              <uses-permission android:name="android.permission.INTERNET" />
-              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-
-              <application
-                  android:allowBackup="true"
-                  android:label="PlusGuard"
-                  android:hardwareAccelerated="true"
-                  android:usesCleartextTraffic="true"
-                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
-
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true"
-                      android:configChanges="orientation|screenSize|keyboardHidden">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                  </activity>
-              </application>
-          </manifest>
-          EOF
-
-          cat << 'EOF' > app/src/main/java/org/plusguard/messenger/MainActivity.java
-          package org.plusguard.messenger;
-
-          import android.app.Activity;
-          import android.app.AlertDialog;
-          import android.content.Context;
-          import android.content.SharedPreferences;
-          import android.graphics.Color;
-          import android.graphics.Typeface;
-          import android.os.Bundle;
-          import android.view.Gravity;
-          import android.view.View;
-          import android.view.ViewGroup;
-          import android.view.WindowManager;
-          import android.webkit.CookieManager;
-          import android.webkit.WebChromeClient;
-          import android.webkit.WebSettings;
-          import android.webkit.WebView;
-          import android.webkit.WebViewClient;
-          import android.widget.Button;
-          import android.widget.EditText;
-          import android.widget.LinearLayout;
-          import android.widget.TextView;
-          import android.widget.Toast;
-
-          public class MainActivity extends Activity {
-
-              private WebView webView;
-              private SharedPreferences prefs;
-              private TextView statusBadge;
-
-              @Override
-              protected void onCreate(Bundle savedInstanceState) {
-                  super.onCreate(savedInstanceState);
-
-                  // Ensure window allows screenshots and screen recording at OS level
-                  getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
-                  getWindow().setStatusBarColor(Color.parseColor("#006955"));
-
-                  prefs = getSharedPreferences("PlusGuardPrefs", Context.MODE_PRIVATE);
-
-                  LinearLayout root = new LinearLayout(this);
-                  root.setOrientation(LinearLayout.VERTICAL);
-                  root.setLayoutParams(new ViewGroup.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT,
-                          ViewGroup.LayoutParams.MATCH_PARENT));
-
-                  // Plus Messenger Top Header Bar
-                  LinearLayout header = new LinearLayout(this);
-                  header.setOrientation(LinearLayout.HORIZONTAL);
-                  header.setBackgroundColor(Color.parseColor("#008069"));
-                  header.setGravity(Gravity.CENTER_VERTICAL);
-                  header.setPadding(32, 24, 32, 24);
-
-                  TextView title = new TextView(this);
-                  title.setText("PlusGuard");
-                  title.setTextColor(Color.WHITE);
-                  title.setTextSize(18f);
-                  title.setTypeface(null, Typeface.BOLD);
-
-                  statusBadge = new TextView(this);
-                  updateStatusBadge();
-                  statusBadge.setTextColor(Color.parseColor("#A7F3D0"));
-                  statusBadge.setTextSize(11f);
-                  statusBadge.setPadding(24, 0, 24, 0);
-
-                  LinearLayout.LayoutParams spacerParams = new LinearLayout.LayoutParams(
-                          0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-                  View spacer = new View(this);
-                  spacer.setLayoutParams(spacerParams);
-
-                  Button wgBtn = new Button(this);
-                  wgBtn.setText("WireGuard");
-                  wgBtn.setTextSize(11f);
-                  wgBtn.setTextColor(Color.WHITE);
-                  wgBtn.setBackgroundColor(Color.parseColor("#00a884"));
-                  wgBtn.setOnClickListener(v -> showWireGuardDialog());
-
-                  header.addView(title);
-                  header.addView(statusBadge);
-                  header.addView(spacer);
-                  header.addView(wgBtn);
-
-                  // Main Telegram Client View
-                  webView = new WebView(this);
-                  webView.setLayoutParams(new LinearLayout.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT,
-                          0, 1.0f));
-
-                  WebSettings settings = webView.getSettings();
-                  settings.setJavaScriptEnabled(true);
-                  settings.setDomStorageEnabled(true);
-                  settings.setDatabaseEnabled(true);
-                  settings.setAllowFileAccess(true);
-                  settings.setAllowContentAccess(true);
-                  settings.setMediaPlaybackRequiresUserGesture(false);
-                  settings.setUserAgentString("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36");
-
-                  CookieManager.getInstance().setAcceptCookie(true);
-                  CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
-
-                  webView.setWebChromeClient(new WebChromeClient());
-                  webView.setWebViewClient(new WebViewClient() {
-                      @Override
-                      public void onPageFinished(WebView view, String url) {
-                          super.onPageFinished(view, url);
-                          injectPlusTheme();
-                      }
-                  });
-
-                  root.addView(header);
-                  root.addView(webView);
-                  setContentView(root);
-
-                  webView.loadUrl("https://web.telegram.org/a/");
-              }
-
-              private void injectPlusTheme() {
-                  String css = "document.documentElement.style.setProperty('--color-primary', '#008069');" +
-                               "document.documentElement.style.setProperty('--color-chat-active', '#008069');";
-                  webView.evaluateJavascript(css, null);
-              }
-
-              private void updateStatusBadge() {
-                  boolean wgActive = prefs.getBoolean("wg_active", false);
-                  statusBadge.setText(wgActive ? "● WG: متصل" : "● حالت پلاس فعال");
-              }
-
-              private void showWireGuardDialog() {
-                  AlertDialog.Builder builder = new AlertDialog.Builder(this);
-                  builder.setTitle("تنظیمات پروکسی WireGuard");
-
-                  final EditText input = new EditText(this);
-                  input.setMinLines(6);
-                  input.setText(prefs.getString("wg_conf",
-                          "[Interface]\nPrivateKey = ...\nAddress = 10.66.66.2/32\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = ...\nEndpoint = 185.199.108.153:51820"));
-                  builder.setView(input);
-
-                  builder.setPositiveButton("ذخیره و اتصال", (dialog, which) -> {
-                      prefs.edit()
-                              .putString("wg_conf", input.getText().toString())
-                              .putBoolean("wg_active", true)
-                              .apply();
-                      updateStatusBadge();
-                      Toast.makeText(this, "کانفیگ WireGuard ذخیره و فعال شد!", Toast.LENGTH_SHORT).show();
-                  });
-
-                  builder.setNegativeButton("قطع اتصال", (dialog, which) -> {
-                      prefs.edit().putBoolean("wg_active", false).apply();
-                      updateStatusBadge();
-                      Toast.makeText(this, "تانل وایرگارد غیرفعال شد", Toast.LENGTH_SHORT).show();
-                  });
-
-                  builder.show();
-              }
-
-              @Override
-              public void onBackPressed() {
-                  if (webView != null && webView.canGoBack()) {
-                      webView.goBack();
-                  } else {
-                      super.onBackPressed();
-                  }
-              }
-          }
-          EOF
-
-      - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
-
-      - name: Upload PlusGuard APK
+      - name: Upload Compiled PlusGuard APK
         uses: actions/upload-artifact@v4
         with:
-          name: PlusGuard-Messenger-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: PlusGuard-Full-Telegram-APK
+          path: telegram-src/TMessagesProj/build/outputs/apk/afat/debug/*.apk
