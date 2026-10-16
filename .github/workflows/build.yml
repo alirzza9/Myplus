@@ -1,0 +1,81 @@
+name: Build Native PlusGuard APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-telegram:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Clone Telegram Android Source
+        run: |
+          git clone --depth 1 --recursive https://github.com/Telegram-FOSS-Team/Telegram-FOSS.git telegram-src
+
+      - name: Apply Plus Theme and Privacy Patches
+        working-directory: telegram-src
+        run: |
+          # 1. Disable FLAG_SECURE across all Java files (Allow Screenshots & Recording)
+          find TMessagesProj -name "*.java" -exec sed -i 's/WindowManager\.LayoutParams\.FLAG_SECURE/0/g' {} +
+
+          # 2. Disable Screenshot Notification in Secret Chats
+          sed -i 's/public void sendScreenshotNotification(/public void sendScreenshotNotification_disabled(/g' TMessagesProj/src/main/java/org/telegram/messenger/SecretChatHelper.java || true
+          sed -i '/public class SecretChatHelper {/a public void sendScreenshotNotification(org.telegram.tgnet.TLRPC.EncryptedChat chat, java.util.ArrayList<Long> messages, org.telegram.tgnet.TLRPC.Message replyMsg) { return; }' TMessagesProj/src/main/java/org/telegram/messenger/SecretChatHelper.java || true
+
+          # 3. Disable Screenshot Notification in Normal/TTL Chats
+          find TMessagesProj -name "ChatActivity.java" -exec sed -i 's/sendScreenshotNotification/\/\/sendScreenshotNotification/g' {} +
+
+          # 4. Unlock Save/Copy/Forward in Restricted Channels (isChatNoForwards -> false)
+          find TMessagesProj -name "MessagesController.java" -exec sed -i 's/return chat\.noforwards;/return false;/g' {} +
+
+          # 5. Apply Plus Messenger Classic Green Color (#008069)
+          find TMessagesProj -name "Theme.java" -exec sed -i 's/0xff527da3/0xff008069/g' {} +
+          find TMessagesProj -name "Theme.java" -exec sed -i 's/0xff5085b1/0xff008069/g' {} +
+
+      - name: Setup Signing Key and API Credentials
+        working-directory: telegram-src
+        run: |
+          mkdir -p TMessagesProj/config
+          keytool -genkey -v -keystore TMessagesProj/config/release.keystore \
+            -alias release -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=PlusGuard, OU=Dev, O=PlusGuard, L=Tehran, S=TH, C=IR"
+
+          cat << 'EOF' >> gradle.properties
+          APP_ID=6
+          APP_HASH=eb06d4abfb49dc3eeb1aeb98ae0f581e
+          RELEASE_KEY_PASSWORD=android
+          RELEASE_KEY_ALIAS=release
+          RELEASE_STORE_PASSWORD=android
+          org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m
+          EOF
+
+      - name: Install Android NDK & CMake
+        run: |
+          yes | sudo $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;21.4.7075529" "cmake;3.18.1" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build Full APK
+        working-directory: telegram-src
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleafatDebug --no-daemon
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlusGuard-Full-APK
+          path: telegram-src/TMessagesProj/build/outputs/apk/afat/debug/*.apk
