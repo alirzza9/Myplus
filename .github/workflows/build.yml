@@ -1,0 +1,288 @@
+name: Build PlusGuard Messenger APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Generate Android Project Structure
+        run: |
+          mkdir -p app/src/main/java/org/plusguard/messenger
+          mkdir -p app/src/main/res/values
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PlusGuard"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.0' apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'org.plusguard.messenger'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "org.plusguard.messenger"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0-PlusGuard"
+              }
+
+              buildTypes {
+                  debug {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="PlusGuard"
+                  android:hardwareAccelerated="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/org/plusguard/messenger/MainActivity.java
+          package org.plusguard.messenger;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.webkit.CookieManager;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+
+              private WebView webView;
+              private SharedPreferences prefs;
+              private TextView statusBadge;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  // Ensure window allows screenshots and screen recording at OS level
+                  getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+                  getWindow().setStatusBarColor(Color.parseColor("#006955"));
+
+                  prefs = getSharedPreferences("PlusGuardPrefs", Context.MODE_PRIVATE);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setLayoutParams(new ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT));
+
+                  // Plus Messenger Top Header Bar
+                  LinearLayout header = new LinearLayout(this);
+                  header.setOrientation(LinearLayout.HORIZONTAL);
+                  header.setBackgroundColor(Color.parseColor("#008069"));
+                  header.setGravity(Gravity.CENTER_VERTICAL);
+                  header.setPadding(32, 24, 32, 24);
+
+                  TextView title = new TextView(this);
+                  title.setText("PlusGuard");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(18f);
+                  title.setTypeface(null, Typeface.BOLD);
+
+                  statusBadge = new TextView(this);
+                  updateStatusBadge();
+                  statusBadge.setTextColor(Color.parseColor("#A7F3D0"));
+                  statusBadge.setTextSize(11f);
+                  statusBadge.setPadding(24, 0, 24, 0);
+
+                  LinearLayout.LayoutParams spacerParams = new LinearLayout.LayoutParams(
+                          0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+                  View spacer = new View(this);
+                  spacer.setLayoutParams(spacerParams);
+
+                  Button wgBtn = new Button(this);
+                  wgBtn.setText("WireGuard");
+                  wgBtn.setTextSize(11f);
+                  wgBtn.setTextColor(Color.WHITE);
+                  wgBtn.setBackgroundColor(Color.parseColor("#00a884"));
+                  wgBtn.setOnClickListener(v -> showWireGuardDialog());
+
+                  header.addView(title);
+                  header.addView(statusBadge);
+                  header.addView(spacer);
+                  header.addView(wgBtn);
+
+                  // Main Telegram Client View
+                  webView = new WebView(this);
+                  webView.setLayoutParams(new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          0, 1.0f));
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+                  settings.setUserAgentString("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36");
+
+                  CookieManager.getInstance().setAcceptCookie(true);
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+
+                  webView.setWebChromeClient(new WebChromeClient());
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          super.onPageFinished(view, url);
+                          injectPlusTheme();
+                      }
+                  });
+
+                  root.addView(header);
+                  root.addView(webView);
+                  setContentView(root);
+
+                  webView.loadUrl("https://web.telegram.org/a/");
+              }
+
+              private void injectPlusTheme() {
+                  String css = "document.documentElement.style.setProperty('--color-primary', '#008069');" +
+                               "document.documentElement.style.setProperty('--color-chat-active', '#008069');";
+                  webView.evaluateJavascript(css, null);
+              }
+
+              private void updateStatusBadge() {
+                  boolean wgActive = prefs.getBoolean("wg_active", false);
+                  statusBadge.setText(wgActive ? "● WG: متصل" : "● حالت پلاس فعال");
+              }
+
+              private void showWireGuardDialog() {
+                  AlertDialog.Builder builder = new AlertDialog.Builder(this);
+                  builder.setTitle("تنظیمات پروکسی WireGuard");
+
+                  final EditText input = new EditText(this);
+                  input.setMinLines(6);
+                  input.setText(prefs.getString("wg_conf",
+                          "[Interface]\nPrivateKey = ...\nAddress = 10.66.66.2/32\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = ...\nEndpoint = 185.199.108.153:51820"));
+                  builder.setView(input);
+
+                  builder.setPositiveButton("ذخیره و اتصال", (dialog, which) -> {
+                      prefs.edit()
+                              .putString("wg_conf", input.getText().toString())
+                              .putBoolean("wg_active", true)
+                              .apply();
+                      updateStatusBadge();
+                      Toast.makeText(this, "کانفیگ WireGuard ذخیره و فعال شد!", Toast.LENGTH_SHORT).show();
+                  });
+
+                  builder.setNegativeButton("قطع اتصال", (dialog, which) -> {
+                      prefs.edit().putBoolean("wg_active", false).apply();
+                      updateStatusBadge();
+                      Toast.makeText(this, "تانل وایرگارد غیرفعال شد", Toast.LENGTH_SHORT).show();
+                  });
+
+                  builder.show();
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload PlusGuard APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlusGuard-Messenger-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
